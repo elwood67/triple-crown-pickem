@@ -1,0 +1,15 @@
+# Database (local dev SQLite)
+horse_picks.db
+horse_picks.db-journal
+
+# Secrets — NEVER commit
+.streamlit/secrets.toml
+.env
+.env.local
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
