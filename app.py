@@ -411,6 +411,7 @@ def init_db():
                 name TEXT NOT NULL,
                 race_date TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'open',
+                race_url TEXT,
                 created_at TEXT NOT NULL
             );
 
@@ -439,9 +440,40 @@ def init_db():
             );
         """)
 
+        # --- Lightweight migrations for older databases ---
+        # Add race_url column if missing (idempotent — uses ADD COLUMN IF NOT EXISTS
+        # on Postgres; SQLite needs a more careful check).
+        _migrate_add_column(conn, "races", "race_url", "TEXT")
+
+
+def _migrate_add_column(conn, table: str, column: str, col_type: str):
+    """Add a column to a table if it doesn't already exist. Works for both backends."""
+    if _is_postgres():
+        # Postgres supports IF NOT EXISTS on ADD COLUMN
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {col_type}")
+    else:
+        # SQLite: check pragma first, then add if missing
+        cur = conn.execute(f"PRAGMA table_info({table})")
+        cols = [row["name"] for row in cur.fetchall()]
+        if column not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+
 
 def now_iso():
     return datetime.utcnow().isoformat(timespec="seconds")
+
+
+def safe_race_url(url: str | None) -> str | None:
+    """Return the URL only if it's a sane http(s) link, else None.
+    Prevents javascript: and data: URLs sneaking into clickable links."""
+    if not url:
+        return None
+    u = url.strip()
+    if not u:
+        return None
+    if not (u.startswith("http://") or u.startswith("https://")):
+        return None
+    return u
 
 
 # ============================================================
@@ -499,14 +531,24 @@ def list_horses(race_id):
         return [dict(r) for r in rows]
 
 
-def create_race(name, race_date):
+def create_race(name, race_date, race_url=None):
     with get_db() as conn:
         cur = conn.execute(
-            "INSERT INTO races (name, race_date, status, created_at) "
-            "VALUES (?, ?, 'open', ?)",
-            (name, race_date, now_iso()),
+            "INSERT INTO races (name, race_date, status, race_url, created_at) "
+            "VALUES (?, ?, 'open', ?, ?)",
+            (name, race_date, race_url, now_iso()),
         )
         return cur.lastrowid
+
+
+def update_race_url(race_id, race_url):
+    """Set or clear the race link. Pass None or '' to clear."""
+    url = (race_url or "").strip() or None
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE races SET race_url = ? WHERE race_id = ?",
+            (url, race_id),
+        )
 
 
 def add_horse(race_id, horse_name, post_position=None, morning_line=None):
@@ -737,7 +779,10 @@ def page_home():
         for race in open_races:
             with st.container(border=True):
                 c1, c2 = st.columns([3, 1])
-                c1.markdown(f"**{race['name']}**  \n*{race['race_date']}*")
+                link_str = ""
+                if race.get("race_url"):
+                    link_str = f"  \n🔗 [View entries / past performances]({race['race_url']})"
+                c1.markdown(f"**{race['name']}**  \n*{race['race_date']}*{link_str}")
                 horse_count = len(list_horses(race["race_id"]))
                 c2.markdown(f"🐎 {horse_count} horses entered")
 
@@ -746,7 +791,10 @@ def page_home():
         for race in settled_races[:3]:
             lb = race_leaderboard(race["race_id"])
             with st.container(border=True):
-                st.markdown(f"**{race['name']}** — *{race['race_date']}*")
+                link_str = ""
+                if race.get("race_url"):
+                    link_str = f" • 🔗 [Race page]({race['race_url']})"
+                st.markdown(f"**{race['name']}** — *{race['race_date']}*{link_str}")
                 if lb:
                     winner = lb[0]
                     st.markdown(f"🏆 Round winner: **{winner['username']}** with {winner['score']} pts")
@@ -783,6 +831,10 @@ def page_make_picks():
         st.success(f"✅ You've already picked for this race. Update below to change.")
 
     st.markdown(f"### Pick your 3 horses for **{race['name']}**")
+    if race.get("race_url"):
+        st.markdown(
+            f"🔗 [**Open entries / past performances on Equibase**]({race['race_url']})"
+        )
     st.caption(
         "All 3 must be different. Order doesn't affect scoring. "
         "**⭐ Favorite | 🎯 Longshot | 💣 Bomb** — picking longshots that hit pays bigger."
@@ -864,6 +916,9 @@ def page_leaderboard():
         race = get_race(race_id)
         lb = race_leaderboard(race_id)
 
+        if race.get("race_url"):
+            st.markdown(f"🔗 [View race entries / results on Equibase]({race['race_url']})")
+
         if race["status"] == "closed":
             st.info("🔒 This race is closed for picks but results haven't been entered yet.")
         if not lb:
@@ -937,7 +992,8 @@ def page_my_picks():
         with st.container(border=True):
             c1, c2 = st.columns([3, 1])
             c1.markdown(f"### {race['name']}")
-            c1.caption(f"{race['race_date']} • Status: **{race['status']}**")
+            link_str = f" • 🔗 [Race page]({race['race_url']})" if race.get("race_url") else ""
+            c1.caption(f"{race['race_date']} • Status: **{race['status']}**{link_str}")
             if race["status"] == "settled":
                 c2.metric("My Score", item["score"])
             else:
@@ -991,12 +1047,20 @@ def page_admin():
         with st.form("new_race"):
             name = st.text_input("Race name (e.g. 'Preakness Stakes 2026')")
             race_date = st.date_input("Race date").isoformat()
+            race_url_input = st.text_input(
+                "Equibase / DRF link (optional)",
+                placeholder="https://www.equibase.com/static/entry/...",
+                help="Paste the entries or PPs page URL — friends will get a clickable button to open the page."
+            )
             submitted = st.form_submit_button("Create Race")
             if submitted:
                 if not name.strip():
                     st.error("Name required.")
                 else:
-                    rid = create_race(name.strip(), race_date)
+                    url = safe_race_url(race_url_input)
+                    if race_url_input.strip() and not url:
+                        st.warning("URL must start with http:// or https:// — saving race without link.")
+                    rid = create_race(name.strip(), race_date, url)
                     st.success(f"Created race #{rid}: {name}")
                     st.rerun()
 
@@ -1006,9 +1070,13 @@ def page_admin():
             with st.container(border=True):
                 c1, c2, c3 = st.columns([3, 1, 1])
                 horse_count = len(list_horses(race["race_id"]))
+                url_str = ""
+                if race.get("race_url"):
+                    url_str = f"  \n🔗 [Race link]({race['race_url']})"
                 c1.markdown(
                     f"**{race['name']}** — *{race['race_date']}*  \n"
                     f"Status: `{race['status']}` • 🐎 {horse_count} horses"
+                    f"{url_str}"
                 )
                 if race["status"] == "open":
                     if c2.button("🔒 Close picks", key=f"close_{race['race_id']}"):
@@ -1040,6 +1108,28 @@ def page_admin():
                     if cc2.button("❌ No", key=f"no_{race['race_id']}"):
                         st.session_state.pop(confirm_key, None)
                         st.rerun()
+
+                # --- Edit URL (expander to keep things tidy) ---
+                with st.expander("🔗 Edit race link"):
+                    new_url = st.text_input(
+                        "Equibase / DRF URL",
+                        value=race.get("race_url") or "",
+                        placeholder="https://www.equibase.com/static/entry/...",
+                        key=f"url_input_{race['race_id']}",
+                    )
+                    bc1, bc2 = st.columns(2)
+                    if bc1.button("💾 Save link", key=f"url_save_{race['race_id']}"):
+                        cleaned = safe_race_url(new_url)
+                        if new_url.strip() and not cleaned:
+                            st.warning("URL must start with http:// or https://")
+                        else:
+                            update_race_url(race["race_id"], cleaned)
+                            st.success("Link updated.")
+                            st.rerun()
+                    if race.get("race_url"):
+                        if bc2.button("🗑️ Remove link", key=f"url_clear_{race['race_id']}"):
+                            update_race_url(race["race_id"], None)
+                            st.rerun()
 
     # --- MANAGE HORSES ------------------------------------------------
     with tab_manage:
