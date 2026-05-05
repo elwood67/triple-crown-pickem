@@ -412,6 +412,7 @@ def init_db():
                 race_date TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'open',
                 race_url TEXT,
+                picks_lock_at TEXT,
                 created_at TEXT NOT NULL
             );
 
@@ -441,9 +442,8 @@ def init_db():
         """)
 
         # --- Lightweight migrations for older databases ---
-        # Add race_url column if missing (idempotent — uses ADD COLUMN IF NOT EXISTS
-        # on Postgres; SQLite needs a more careful check).
         _migrate_add_column(conn, "races", "race_url", "TEXT")
+        _migrate_add_column(conn, "races", "picks_lock_at", "TEXT")
 
 
 def _migrate_add_column(conn, table: str, column: str, col_type: str):
@@ -474,6 +474,86 @@ def safe_race_url(url: str | None) -> str | None:
     if not (u.startswith("http://") or u.startswith("https://")):
         return None
     return u
+
+
+# ============================================================
+# DEADLINE / TIME HELPERS
+# ============================================================
+# All deadlines are stored in Eastern Time (US racing convention) as
+# naive ISO strings like "2026-05-16T18:00:00". We compare in ET, display in ET.
+
+from datetime import timezone, timedelta
+
+# US Eastern Time. Note: this doesn't auto-handle DST cleanly but
+# for picks-lock comparison it's close enough — the lock window is
+# wide and missing by an hour around DST transitions doesn't matter.
+# For perfect DST handling, install zoneinfo (Python 3.9+).
+try:
+    from zoneinfo import ZoneInfo
+    ET = ZoneInfo("America/New_York")
+except ImportError:
+    # Fallback: fixed UTC-5 offset (won't handle DST)
+    ET = timezone(timedelta(hours=-5))
+
+
+def now_et() -> datetime:
+    """Current time in Eastern Time (timezone-aware)."""
+    return datetime.now(ET)
+
+
+def parse_lock_time(iso_str: str | None) -> datetime | None:
+    """Parse a stored ISO datetime string as Eastern Time (timezone-aware).
+    Returns None if invalid or empty."""
+    if not iso_str:
+        return None
+    try:
+        dt = datetime.fromisoformat(iso_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=ET)
+        return dt
+    except (ValueError, TypeError):
+        return None
+
+
+def is_locked(lock_at_iso: str | None) -> bool:
+    """True if the deadline has passed. Picks should be rejected."""
+    dt = parse_lock_time(lock_at_iso)
+    if dt is None:
+        return False  # no deadline set → never locked (legacy races)
+    return now_et() >= dt
+
+
+def format_lock_time(iso_str: str | None) -> str:
+    """Format a deadline for human display, e.g. 'Sat May 16, 6:00 PM ET'."""
+    dt = parse_lock_time(iso_str)
+    if dt is None:
+        return ""
+    return dt.strftime("%a %b %-d, %-I:%M %p ET") if hasattr(dt, "strftime") else str(dt)
+
+
+def time_until_lock(lock_at_iso: str | None) -> str:
+    """Human-readable time-until-lock, e.g. '2 hours 14 minutes' or 'just a moment'.
+    Returns '' if no deadline. Returns 'closed' if past."""
+    dt = parse_lock_time(lock_at_iso)
+    if dt is None:
+        return ""
+    delta = dt - now_et()
+    secs = int(delta.total_seconds())
+    if secs <= 0:
+        return "closed"
+    days = secs // 86400
+    hours = (secs % 86400) // 3600
+    minutes = (secs % 3600) // 60
+    parts = []
+    if days:
+        parts.append(f"{days} day{'s' if days != 1 else ''}")
+    if hours:
+        parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
+    if minutes and not days:  # don't show minutes if we're showing days
+        parts.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
+    if not parts:
+        return "less than a minute"
+    return " ".join(parts)
 
 
 # ============================================================
@@ -531,12 +611,12 @@ def list_horses(race_id):
         return [dict(r) for r in rows]
 
 
-def create_race(name, race_date, race_url=None):
+def create_race(name, race_date, race_url=None, picks_lock_at=None):
     with get_db() as conn:
         cur = conn.execute(
-            "INSERT INTO races (name, race_date, status, race_url, created_at) "
-            "VALUES (?, ?, 'open', ?, ?)",
-            (name, race_date, race_url, now_iso()),
+            "INSERT INTO races (name, race_date, status, race_url, picks_lock_at, created_at) "
+            "VALUES (?, ?, 'open', ?, ?, ?)",
+            (name, race_date, race_url, picks_lock_at, now_iso()),
         )
         return cur.lastrowid
 
@@ -549,6 +629,31 @@ def update_race_url(race_id, race_url):
             "UPDATE races SET race_url = ? WHERE race_id = ?",
             (url, race_id),
         )
+
+
+def update_picks_lock_at(race_id, picks_lock_at: str | None):
+    """Set or clear the picks deadline. Pass None to clear."""
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE races SET picks_lock_at = ? WHERE race_id = ?",
+            (picks_lock_at, race_id),
+        )
+
+
+def auto_close_expired_races():
+    """Flip any race from 'open' to 'closed' if its picks deadline has passed.
+    Called on every page load; cheap and idempotent."""
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT race_id, picks_lock_at FROM races WHERE status = 'open' AND picks_lock_at IS NOT NULL"
+        ).fetchall()
+        for r in rows:
+            row = dict(r)
+            if is_locked(row["picks_lock_at"]):
+                conn.execute(
+                    "UPDATE races SET status = 'closed' WHERE race_id = ?",
+                    (row["race_id"],),
+                )
 
 
 def add_horse(race_id, horse_name, post_position=None, morning_line=None):
@@ -595,11 +700,22 @@ def set_finishing_positions(race_id, position_map):
 
 
 def save_picks(username, race_id, horse_ids):
-    """horse_ids is a list of 3 horse_ids in slot order. Replaces any existing picks."""
+    """horse_ids is a list of 3 horse_ids in slot order. Replaces any existing picks.
+    Raises if race is locked or already closed."""
     if len(horse_ids) != 3:
         raise ValueError("Must pick exactly 3 horses")
     if len(set(horse_ids)) != 3:
         raise ValueError("All 3 horses must be different")
+
+    # Server-side deadline enforcement — defense in depth.
+    race = get_race(race_id)
+    if race is None:
+        raise ValueError("Race not found")
+    if race["status"] != "open":
+        raise ValueError(f"Picks are closed for this race (status: {race['status']})")
+    if is_locked(race.get("picks_lock_at")):
+        raise ValueError("The picks deadline for this race has passed")
+
     with get_db() as conn:
         conn.execute(
             "DELETE FROM picks WHERE username = ? AND race_id = ?",
@@ -782,7 +898,11 @@ def page_home():
                 link_str = ""
                 if race.get("race_url"):
                     link_str = f"  \n🔗 [View entries / past performances]({race['race_url']})"
-                c1.markdown(f"**{race['name']}**  \n*{race['race_date']}*{link_str}")
+                lock_str = ""
+                if race.get("picks_lock_at"):
+                    remaining = time_until_lock(race["picks_lock_at"])
+                    lock_str = f"  \n⏰ Picks lock in **{remaining}** ({format_lock_time(race['picks_lock_at'])})"
+                c1.markdown(f"**{race['name']}**  \n*{race['race_date']}*{link_str}{lock_str}")
                 horse_count = len(list_horses(race["race_id"]))
                 c2.markdown(f"🐎 {horse_count} horses entered")
 
@@ -835,6 +955,18 @@ def page_make_picks():
         st.markdown(
             f"🔗 [**Open entries / past performances on Equibase**]({race['race_url']})"
         )
+
+    # Countdown / lock banner
+    if race.get("picks_lock_at"):
+        if is_locked(race["picks_lock_at"]):
+            st.error(f"🔒 Picks closed at {format_lock_time(race['picks_lock_at'])}. No further changes.")
+        else:
+            remaining = time_until_lock(race["picks_lock_at"])
+            st.info(
+                f"⏰ Picks lock at **{format_lock_time(race['picks_lock_at'])}** — "
+                f"that's **{remaining}** from now."
+            )
+
     st.caption(
         "All 3 must be different. Order doesn't affect scoring. "
         "**⭐ Favorite | 🎯 Longshot | 💣 Bomb** — picking longshots that hit pays bigger."
@@ -867,7 +999,13 @@ def page_make_picks():
     pick2 = col2.selectbox("🐎 Pick #2", options, index=default_indices[1], key="p2")
     pick3 = col3.selectbox("🐎 Pick #3", options, index=default_indices[2], key="p3")
 
-    if st.button("🔒 Lock In My Picks", type="primary", use_container_width=True):
+    locked = is_locked(race.get("picks_lock_at"))
+    if st.button(
+        "🔒 Lock In My Picks",
+        type="primary",
+        use_container_width=True,
+        disabled=locked,
+    ):
         picks_raw = [pick1, pick2, pick3]
         if none_label in picks_raw:
             st.error("Please select all 3 horses.")
@@ -1046,7 +1184,16 @@ def page_admin():
         st.markdown("### Create a new race")
         with st.form("new_race"):
             name = st.text_input("Race name (e.g. 'Preakness Stakes 2026')")
-            race_date = st.date_input("Race date").isoformat()
+            from datetime import time as _time, date as _date
+            race_date_obj = st.date_input("Race date")
+            race_date = race_date_obj.isoformat()
+
+            st.markdown("**Picks lock at (Eastern Time)** — required")
+            st.caption("After this time, no new picks or changes can be saved. Friends see a countdown.")
+            lc1, lc2 = st.columns(2)
+            lock_date_obj = lc1.date_input("Lock date", value=race_date_obj, key="lock_date_new")
+            lock_time_obj = lc2.time_input("Lock time (ET)", value=_time(18, 0), key="lock_time_new")
+
             race_url_input = st.text_input(
                 "Equibase / DRF link (optional)",
                 placeholder="https://www.equibase.com/static/entry/...",
@@ -1057,12 +1204,20 @@ def page_admin():
                 if not name.strip():
                     st.error("Name required.")
                 else:
-                    url = safe_race_url(race_url_input)
-                    if race_url_input.strip() and not url:
-                        st.warning("URL must start with http:// or https:// — saving race without link.")
-                    rid = create_race(name.strip(), race_date, url)
-                    st.success(f"Created race #{rid}: {name}")
-                    st.rerun()
+                    # Combine lock date + time into a naive ISO string (treated as ET)
+                    lock_dt = datetime.combine(lock_date_obj, lock_time_obj)
+                    lock_iso = lock_dt.isoformat(timespec="seconds")
+                    if datetime.now(ET).replace(tzinfo=None) >= lock_dt:
+                        st.error("Lock time is already in the past — pick a future time.")
+                    else:
+                        url = safe_race_url(race_url_input)
+                        if race_url_input.strip() and not url:
+                            st.warning("URL must start with http:// or https:// — saving race without link.")
+                        rid = create_race(name.strip(), race_date, url, lock_iso)
+                        st.success(
+                            f"Created race #{rid}: {name} — picks lock {format_lock_time(lock_iso)}"
+                        )
+                        st.rerun()
 
         st.markdown("---")
         st.markdown("### Existing races")
@@ -1073,10 +1228,19 @@ def page_admin():
                 url_str = ""
                 if race.get("race_url"):
                     url_str = f"  \n🔗 [Race link]({race['race_url']})"
+                lock_str = ""
+                if race.get("picks_lock_at"):
+                    lock_fmt = format_lock_time(race["picks_lock_at"])
+                    if is_locked(race["picks_lock_at"]):
+                        lock_str = f"  \n⏰ Picks were due **{lock_fmt}**"
+                    else:
+                        lock_str = f"  \n⏰ Picks lock **{lock_fmt}** (in {time_until_lock(race['picks_lock_at'])})"
+                else:
+                    lock_str = "  \n⚠️ *No lock time set — please set one below*"
                 c1.markdown(
                     f"**{race['name']}** — *{race['race_date']}*  \n"
                     f"Status: `{race['status']}` • 🐎 {horse_count} horses"
-                    f"{url_str}"
+                    f"{url_str}{lock_str}"
                 )
                 if race["status"] == "open":
                     if c2.button("🔒 Close picks", key=f"close_{race['race_id']}"):
@@ -1130,6 +1294,32 @@ def page_admin():
                         if bc2.button("🗑️ Remove link", key=f"url_clear_{race['race_id']}"):
                             update_race_url(race["race_id"], None)
                             st.rerun()
+
+                # --- Edit picks deadline ---
+                with st.expander("⏰ Edit picks deadline"):
+                    from datetime import time as _time
+                    existing_lock = parse_lock_time(race.get("picks_lock_at"))
+                    default_date = existing_lock.date() if existing_lock else datetime.fromisoformat(race["race_date"]).date()
+                    default_time = existing_lock.time().replace(tzinfo=None) if existing_lock else _time(18, 0)
+                    if hasattr(default_time, "tzinfo"):
+                        # Strip tzinfo for time_input compatibility
+                        default_time = _time(default_time.hour, default_time.minute)
+                    edit_date = st.date_input(
+                        "Lock date",
+                        value=default_date,
+                        key=f"lock_date_{race['race_id']}",
+                    )
+                    edit_time = st.time_input(
+                        "Lock time (Eastern Time)",
+                        value=default_time,
+                        key=f"lock_time_{race['race_id']}",
+                    )
+                    if st.button("💾 Save deadline", key=f"lock_save_{race['race_id']}"):
+                        new_lock_dt = datetime.combine(edit_date, edit_time)
+                        new_lock_iso = new_lock_dt.isoformat(timespec="seconds")
+                        update_picks_lock_at(race["race_id"], new_lock_iso)
+                        st.success(f"Deadline updated to {format_lock_time(new_lock_iso)}.")
+                        st.rerun()
 
     # --- MANAGE HORSES ------------------------------------------------
     with tab_manage:
@@ -1352,6 +1542,7 @@ def sidebar():
 # ============================================================
 def main():
     init_db()
+    auto_close_expired_races()
     page = sidebar()
     if page == "🏠 Home":
         page_home()
