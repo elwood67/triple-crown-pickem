@@ -530,6 +530,12 @@ def update_race_status(race_id, status):
         )
 
 
+def delete_race(race_id):
+    """Delete a race and all its horses + picks (FK CASCADE handles the children)."""
+    with get_db() as conn:
+        conn.execute("DELETE FROM races WHERE race_id = ?", (race_id,))
+
+
 def set_finishing_positions(race_id, position_map):
     """position_map: {horse_id: final_position or None}"""
     with get_db() as conn:
@@ -999,7 +1005,11 @@ def page_admin():
         for race in list_races():
             with st.container(border=True):
                 c1, c2, c3 = st.columns([3, 1, 1])
-                c1.markdown(f"**{race['name']}** — *{race['race_date']}*  \nStatus: `{race['status']}`")
+                horse_count = len(list_horses(race["race_id"]))
+                c1.markdown(
+                    f"**{race['name']}** — *{race['race_date']}*  \n"
+                    f"Status: `{race['status']}` • 🐎 {horse_count} horses"
+                )
                 if race["status"] == "open":
                     if c2.button("🔒 Close picks", key=f"close_{race['race_id']}"):
                         update_race_status(race["race_id"], "closed")
@@ -1011,6 +1021,24 @@ def page_admin():
                 if race["status"] == "settled":
                     if c2.button("↩️ Unsettle", key=f"unsettle_{race['race_id']}"):
                         update_race_status(race["race_id"], "closed")
+                        st.rerun()
+
+                # --- Delete with 2-step confirmation ---
+                confirm_key = f"confirm_delete_{race['race_id']}"
+                if not st.session_state.get(confirm_key):
+                    if c3.button("🗑️ Delete", key=f"delete_{race['race_id']}"):
+                        st.session_state[confirm_key] = True
+                        st.rerun()
+                else:
+                    c3.warning("⚠️ Sure?")
+                    cc1, cc2 = c3.columns(2)
+                    if cc1.button("✅ Yes", key=f"yes_{race['race_id']}"):
+                        delete_race(race["race_id"])
+                        st.session_state.pop(confirm_key, None)
+                        st.success(f"Deleted '{race['name']}'.")
+                        st.rerun()
+                    if cc2.button("❌ No", key=f"no_{race['race_id']}"):
+                        st.session_state.pop(confirm_key, None)
                         st.rerun()
 
     # --- MANAGE HORSES ------------------------------------------------
