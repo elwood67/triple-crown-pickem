@@ -1,5 +1,5 @@
 """
-🏇 Triple Crown Pick'em — A friends-only horse race picking app
+🏇 Across the Board — A friends-only horse race picking app
 ================================================================
 Pick 3 horses per race, score points based on their finishing positions,
 climb the leaderboard. No money, just bragging rights.
@@ -96,7 +96,7 @@ def score_for_position_with_odds(pos: int | None, ml: str | None) -> tuple[int, 
     return (base, mult, round(base * mult))
 
 st.set_page_config(
-    page_title="🏇 Triple Crown Pick'em",
+    page_title="🏇 Across the Board",
     page_icon="🏇",
     layout="wide",
 )
@@ -847,8 +847,8 @@ def medal_for_rank(rank):
 # PAGES
 # ============================================================
 def page_home():
-    st.title("🏇 Triple Crown Pick'em")
-    st.caption("Pick 3 horses. Score points. Bragging rights only — no money, just glory.")
+    st.title("🏇 Across the Board")
+    st.caption("Pick 3 horses across the board. Score points. Bragging rights only — no money, just glory.")
 
     st.markdown("---")
 
@@ -1494,7 +1494,7 @@ def page_admin():
 # SIDEBAR
 # ============================================================
 def sidebar():
-    st.sidebar.title("🏇 Pick'em")
+    st.sidebar.title("🏇 Across the Board")
     st.sidebar.markdown("---")
 
     # Username
